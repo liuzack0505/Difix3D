@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import sys
 import time
 from dataclasses import dataclass, field
 from collections import defaultdict
@@ -19,6 +20,7 @@ import random
 from PIL import Image
 from copy import deepcopy
 from datasets.colmap import Dataset, Parser
+from datasets.target import TargetParser
 from datasets.traj import (
     generate_interpolated_path,
     generate_ellipse_path_z,
@@ -53,8 +55,13 @@ from src.pipeline_difix import DifixPipeline
 class Config:
     # Disable viewer
     disable_viewer: bool = True # ! turn off viser
-    # Path to the .pt files. If provide, it will skip training and run evaluation only.
+    # Gsplat .pt checkpoints or standard 3DGS .ply files to fine-tune from step zero.
+    # Multiple files are concatenated, e.g. all shards of a distributed checkpoint.
     ckpt: Optional[List[str]] = None
+    # JSON cameras used directly as Difix targets (intrinsics are at full resolution).
+    target_frame_path: Optional[str] = None
+    # Whether JSON poses already use the model's normalized world coordinates.
+    target_world_space: Literal["original", "normalized"] = "original"
     # Name of compression strategy to use
     compression: Optional[Literal["png"]] = None
     # Render trajectory path
@@ -194,6 +201,71 @@ class Config:
             assert_never(strategy)
 
 
+def load_checkpoint(path: str) -> Dict:
+    """Load gsplat weights or a standard 3DGS PLY in optimizer parameter space."""
+    extension = os.path.splitext(path)[1].lower()
+    if extension == ".pt":
+        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+        if not isinstance(checkpoint, dict) or not isinstance(checkpoint.get("splats"), dict):
+            raise ValueError(f"{path}: expected a gsplat checkpoint containing a 'splats' state dict.")
+        return checkpoint
+    if extension != ".ply":
+        raise ValueError(f"{path}: checkpoint extension must be .pt or .ply.")
+    try:
+        from plyfile import PlyData
+    except ImportError as exc:
+        raise ImportError("PLY loading requires plyfile: pip install plyfile") from exc
+
+    vertices = PlyData.read(path)["vertex"]
+    names = vertices.data.dtype.names
+
+    def columns(fields):
+        missing = set(fields) - set(names)
+        if missing:
+            raise ValueError(f"{path}: missing 3DGS PLY properties: {sorted(missing)}")
+        return torch.from_numpy(np.stack([vertices[name] for name in fields], axis=-1).astype(np.float32))
+
+    rest_names = [name for name in names if name.startswith("f_rest_")]
+    expected_rest = [f"f_rest_{i}" for i in range(len(rest_names))]
+    if set(rest_names) != set(expected_rest):
+        raise ValueError(f"{path}: f_rest_ properties must use contiguous indices starting at zero.")
+    coefficient_count = len(rest_names) // 3 + 1
+    if len(rest_names) % 3 or math.isqrt(coefficient_count) ** 2 != coefficient_count:
+        raise ValueError(f"{path}: invalid spherical-harmonic coefficient count.")
+    means = columns(["x", "y", "z"])
+    # Standard 3DGS stores SH coefficients channel-first; gsplat uses [N, K, 3].
+    shN = (columns(expected_rest).reshape(len(means), 3, coefficient_count - 1)
+           .transpose(1, 2).contiguous() if rest_names else torch.empty(len(means), 0, 3))
+    return {"splats": {
+        "means": means,
+        "scales": columns([f"scale_{i}" for i in range(3)]),
+        "quats": columns([f"rot_{i}" for i in range(4)]),
+        "opacities": columns(["opacity"]).squeeze(-1),
+        "sh0": columns([f"f_dc_{i}" for i in range(3)]).unsqueeze(1),
+        "shN": shN,
+    }}
+
+
+def load_checkpoints(paths: List[str]) -> Dict:
+    """Combine model shards before distributing Gaussians across training ranks."""
+    if not paths:
+        raise ValueError("ckpt requires at least one .pt or .ply path.")
+    checkpoints = [load_checkpoint(path) for path in paths]
+    keys = set(checkpoints[0]["splats"])
+    if any(set(checkpoint["splats"]) != keys for checkpoint in checkpoints):
+        raise ValueError("Checkpoint files must contain the same splat parameter keys.")
+    for key in keys:
+        values = [checkpoint["splats"][key] for checkpoint in checkpoints]
+        if any(not isinstance(value, torch.Tensor) or value.ndim == 0 for value in values):
+            raise ValueError(f"Checkpoint {key} must be a tensor with a Gaussian dimension.")
+        if any(value.shape[1:] != values[0].shape[1:] for value in values):
+            raise ValueError(f"Checkpoint files have incompatible {key} shapes.")
+    return {**checkpoints[0], "splats": {
+        key: torch.cat([checkpoint["splats"][key] for checkpoint in checkpoints], dim=0)
+        for key in keys
+    }}
+
+
 def create_splats_with_optimizers(
     parser: Parser,
     init_type: str = "sfm",
@@ -210,50 +282,73 @@ def create_splats_with_optimizers(
     device: str = "cuda",
     world_rank: int = 0,
     world_size: int = 1,
+    pretrained_splats: Optional[Dict[str, Tensor]] = None,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
-    if init_type == "sfm":
-        points = torch.from_numpy(parser.points).float()
-        rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
-    elif init_type == "random":
-        points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
-        rgbs = torch.rand((init_num_pts, 3))
+    if pretrained_splats is not None:
+        shapes = {"means": (3,), "scales": (3,), "quats": (4,), "opacities": ()}
+        if feature_dim is None:
+            shapes.update(sh0=(1, 3), shN=((sh_degree + 1) ** 2 - 1, 3))
+        else:
+            shapes.update(features=(feature_dim,), colors=(3,))
+        if set(pretrained_splats) != set(shapes):
+            raise ValueError("Checkpoint splat keys do not match the configured appearance mode.")
+        count = pretrained_splats["means"].shape[0]
+        if count < world_size:
+            raise ValueError("Checkpoint must have at least one Gaussian per rank.")
+        rates = {"means": 1.6e-4 / 10 * scene_scale, "scales": 5e-3 / 5,
+                 "quats": 1e-3 / 5, "opacities": 5e-2 / 5,
+                 "sh0": 2.5e-3 / 50, "shN": 2.5e-3 / 20 / 50,
+                 "features": 2.5e-3, "colors": 2.5e-3}
+        params = []
+        for name, shape in shapes.items():
+            value = pretrained_splats[name]
+            if tuple(value.shape) != (count, *shape):
+                raise ValueError(f"Checkpoint {name} has shape {tuple(value.shape)}; expected {(count, *shape)}. Check sh_degree/app_opt.")
+            params.append((name, torch.nn.Parameter(value[world_rank::world_size].detach().float().clone()), rates[name]))
     else:
-        raise ValueError("Please specify a correct init_type: sfm or random")
+        if init_type == "sfm":
+            points = torch.from_numpy(parser.points).float()
+            rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
+        elif init_type == "random":
+            points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
+            rgbs = torch.rand((init_num_pts, 3))
+        else:
+            raise ValueError("Please specify a correct init_type: sfm or random")
 
-    # Initialize the GS size to be the average dist of the 3 nearest neighbors
-    dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
-    dist_avg = torch.sqrt(dist2_avg)
-    scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
+        # Initialize the GS size to be the average dist of the 3 nearest neighbors
+        dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
+        dist_avg = torch.sqrt(dist2_avg)
+        scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
 
-    # Distribute the GSs to different ranks (also works for single rank)
-    points = points[world_rank::world_size]
-    rgbs = rgbs[world_rank::world_size]
-    scales = scales[world_rank::world_size]
+        # Distribute the GSs to different ranks (also works for single rank)
+        points = points[world_rank::world_size]
+        rgbs = rgbs[world_rank::world_size]
+        scales = scales[world_rank::world_size]
 
-    N = points.shape[0]
-    quats = torch.rand((N, 4))  # [N, 4]
-    opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
+        N = points.shape[0]
+        quats = torch.rand((N, 4))  # [N, 4]
+        opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
 
-    params = [
-        # name, value, lr
-        ("means", torch.nn.Parameter(points), 1.6e-4 / 10 * scene_scale),
-        ("scales", torch.nn.Parameter(scales), 5e-3 / 5),
-        ("quats", torch.nn.Parameter(quats), 1e-3 / 5),
-        ("opacities", torch.nn.Parameter(opacities), 5e-2 / 5),
-    ]
+        params = [
+            # name, value, lr
+            ("means", torch.nn.Parameter(points), 1.6e-4 / 10 * scene_scale),
+            ("scales", torch.nn.Parameter(scales), 5e-3 / 5),
+            ("quats", torch.nn.Parameter(quats), 1e-3 / 5),
+            ("opacities", torch.nn.Parameter(opacities), 5e-2 / 5),
+        ]
 
-    if feature_dim is None:
-        # color is SH coefficients.
-        colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
-        colors[:, 0, :] = rgb_to_sh(rgbs)
-        params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), 2.5e-3 / 50))
-        params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), 2.5e-3 / 20 / 50))
-    else:
-        # features will be used for appearance and view-dependent shading
-        features = torch.rand(N, feature_dim)  # [N, feature_dim]
-        params.append(("features", torch.nn.Parameter(features), 2.5e-3))
-        colors = torch.logit(rgbs)  # [N, 3]
-        params.append(("colors", torch.nn.Parameter(colors), 2.5e-3))
+        if feature_dim is None:
+            # color is SH coefficients.
+            colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
+            colors[:, 0, :] = rgb_to_sh(rgbs)
+            params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), 2.5e-3 / 50))
+            params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), 2.5e-3 / 20 / 50))
+        else:
+            # features will be used for appearance and view-dependent shading
+            features = torch.rand(N, feature_dim)  # [N, feature_dim]
+            params.append(("features", torch.nn.Parameter(features), 2.5e-3))
+            colors = torch.logit(rgbs)  # [N, 3]
+            params.append(("colors", torch.nn.Parameter(colors), 2.5e-3))
 
     splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
     # Scale learning rate based on batch size, reference:
@@ -325,6 +420,22 @@ class Runner:
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
+        # The targetset is different from valset. Targetset didn't have GT for evaluation. It is used for gradual target view optimization.
+        self.target_parser = None
+        self.targetset = None
+        if cfg.target_frame_path is not None:
+            if cfg.camera_model != "pinhole":
+                raise ValueError("JSON target cameras require camera_model=pinhole.")
+            if cfg.depth_loss or cfg.pose_opt or cfg.pose_noise or cfg.app_opt or cfg.use_bilateral_grid:
+                raise ValueError("JSON targets currently require depth_loss, pose_opt, pose_noise, app_opt and use_bilateral_grid to be disabled.")
+            self.target_parser = TargetParser(
+                cfg.target_frame_path, cfg.data_factor,
+                self.parser.transform if cfg.target_world_space == "original" else np.eye(4),
+            )
+            self.targetset = Dataset(self.target_parser, split="test", load_images=False)
+
+        checkpoint = load_checkpoints(cfg.ckpt) if cfg.ckpt is not None else None
+
         # Model
         feature_dim = 32 if cfg.app_opt else None
         self.splats, self.optimizers = create_splats_with_optimizers(
@@ -343,6 +454,7 @@ class Runner:
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
+            pretrained_splats=checkpoint["splats"] if checkpoint is not None else None,
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 
@@ -425,6 +537,15 @@ class Runner:
                 ),
             ]
 
+        if checkpoint is not None:
+            for enabled, name in ((cfg.pose_opt, "pose_adjust"), (cfg.app_opt, "app_module")):
+                if enabled:
+                    if name not in checkpoint:
+                        raise ValueError(f"Checkpoint is missing required {name} weights.")
+                    module = getattr(self, name)
+                    (module.module if isinstance(module, DDP) else module).load_state_dict(checkpoint[name])
+            print(f"Loaded {cfg.ckpt} for fine-tuning from step 0.")
+
         # Losses & Metrics.
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
         self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
@@ -454,6 +575,9 @@ class Runner:
         self.interpolator = CameraPoseInterpolator(rotation_weight=1.0, translation_weight=1.0)
 
         self.current_novel_poses = self.parser.camtoworlds[self.trainset.indices]
+        if self.targetset is not None:
+            if len(self.current_novel_poses) == 0:
+                raise ValueError("Gradual target views require at least one training camera.")
         self.current_parser = self.parser
 
         self.novelloaders = []
@@ -619,7 +743,7 @@ class Runner:
                 camtoworlds = self.pose_adjust(camtoworlds, image_ids)
 
             # sh schedule
-            sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
+            sh_degree_to_use = cfg.sh_degree if cfg.ckpt else min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
             # forward
             renders, alphas, info = self.rasterize_splats(
@@ -859,12 +983,19 @@ class Runner:
     @torch.no_grad()
     def fix(self, step: int):
         print("Running fixer...")
+        target_poses = (
+            self.target_parser.camtoworlds[self.targetset.indices]
+            if self.targetset is not None
+            else self.parser.camtoworlds[self.valset.indices]
+        )
         if len(self.cfg.fix_steps) == 1:
-            novel_poses = self.parser.camtoworlds[self.valset.indices]
+            novel_poses = target_poses
         else:
-            novel_poses = self.interpolator.shift_poses(self.current_novel_poses, self.parser.camtoworlds[self.valset.indices], distance=0.5)
-        
-        self.render_traj(step, novel_poses)
+            novel_poses = self.interpolator.shift_poses(
+                self.current_novel_poses, target_poses
+            )
+
+        self.render_traj(step, novel_poses, dataset=self.targetset)
         image_paths = [f"{self.render_dir}/novel/{step}/Pred/{i:04d}.png" for i in range(len(novel_poses))]
 
         if len(self.novelloaders) == 0:
@@ -886,19 +1017,32 @@ class Runner:
                 os.makedirs(f"{self.render_dir}/novel/{step}/Ref", exist_ok=True)
                 ref_image.save(f"{self.render_dir}/novel/{step}/Ref/{i:04d}.png")
     
-        parser = deepcopy(self.parser)
+        parser = deepcopy(self.target_parser if self.target_parser is not None else self.parser)
         parser.test_every = 0
         parser.image_paths = [f"{self.render_dir}/novel/{step}/Fixed/{i:04d}.png" for i in range(len(novel_poses))]
         parser.image_names = [os.path.basename(p) for p in parser.image_paths]
         parser.alpha_mask_paths = [f"{self.render_dir}/novel/{step}/Alpha/{i:04d}.png" for i in range(len(novel_poses))]
         parser.camtoworlds = novel_poses
-        parser.camera_ids = [parser.camera_ids[0]] * len(novel_poses)
+        parser.camera_ids = list(range(len(novel_poses)))
+        if self.targetset is None:
+            source_id = self.parser.camera_ids[0]
+            Ks = [self.parser.Ks_dict[source_id]] * len(novel_poses)
+            sizes = [self.parser.imsize_dict[source_id]] * len(novel_poses)
+        else:
+            camera_ids = [self.target_parser.camera_ids[i] for i in self.targetset.indices]
+            Ks = [self.target_parser.Ks_dict[i] for i in camera_ids]
+            sizes = [self.target_parser.imsize_dict[i] for i in camera_ids]
+        parser.Ks_dict = dict(enumerate(Ks))
+        parser.imsize_dict = dict(enumerate(sizes))
+        # Rendered images are already undistorted.
+        parser.params_dict = {i: np.empty(0) for i in parser.camera_ids}
+        parser.mask_dict = {i: None for i in parser.camera_ids}
         
         print(f"Adding {len(parser.image_paths)} fixed images to novel dataset...")
         dataset = Dataset(parser, split="train")
         dataloader = torch.utils.data.DataLoader(
             dataset,
-            batch_size=self.cfg.batch_size,
+            batch_size=1 if len(set(sizes)) > 1 else self.cfg.batch_size,
             shuffle=True,
             num_workers=4,
             persistent_workers=True,
@@ -1002,13 +1146,13 @@ class Runner:
             self.writer.flush()
 
     @torch.no_grad()
-    def render_traj(self, step: int, camtoworlds_all=None, batch_size=8, tag="novel"):
+    def render_traj(self, step: int, camtoworlds_all=None, batch_size=8, tag="novel", dataset=None):
         """Entry for trajectory rendering."""
         print("Running trajectory rendering...")
         cfg = self.cfg
         device = self.device
 
-        if camtoworlds_all is None:
+        if camtoworlds_all is None and dataset is None:
             camtoworlds_all = self.parser.camtoworlds[5:-5]
             if cfg.render_traj_path == "interp":
                 camtoworlds_all = generate_interpolated_path(
@@ -1040,14 +1184,32 @@ class Runner:
                 axis=1,
             )  # [N, 4, 4]
 
-        camtoworlds_all = torch.from_numpy(camtoworlds_all).float().to(device)
-        K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
-        width, height = list(self.parser.imsize_dict.values())[0]
+        if dataset is not None and camtoworlds_all is not None and len(camtoworlds_all) != len(dataset):
+            raise ValueError("Pose overrides must have one pose per dataset camera.")
 
-        for i in tqdm.trange(0, len(camtoworlds_all), batch_size, desc="Rendering trajectory"):
-            camtoworlds = camtoworlds_all[i : i + batch_size]
-            Ks = K[None].repeat(camtoworlds.shape[0], 1, 1)
+        def camera_batches():
+            if dataset is not None:
+                # One frame per batch allows independent target image dimensions.
+                loader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False)
+                for i, data in enumerate(loader):
+                    poses = data["camtoworld"].to(device)
+                    if camtoworlds_all is not None:
+                        # Keep target intrinsics, but render the current intermediate pose.
+                        poses = torch.as_tensor(camtoworlds_all[i:i + 1], dtype=torch.float32, device=device)
+                    yield (i, poses, data["K"].to(device),
+                           int(data["width"].item()), int(data["height"].item()))
+            else:
+                poses = torch.from_numpy(camtoworlds_all).float().to(device)
+                K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
+                width, height = list(self.parser.imsize_dict.values())[0]
+                for i in range(0, len(poses), batch_size):
+                    batch = poses[i : i + batch_size]
+                    yield i, batch, K[None].repeat(len(batch), 1, 1), width, height
 
+        total = len(dataset) if dataset is not None else math.ceil(len(camtoworlds_all) / batch_size)
+        for i, camtoworlds, Ks, width, height in tqdm.tqdm(
+            camera_batches(), total=total, desc="Rendering trajectory"
+        ):
             renders, alphas, _ = self.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
@@ -1124,18 +1286,7 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
 
     runner = Runner(local_rank, world_rank, world_size, cfg)
 
-    if cfg.ckpt is not None:
-        # run eval only
-        ckpts = [
-            torch.load(file, map_location=runner.device, weights_only=True)
-            for file in cfg.ckpt
-        ]
-        for k in runner.splats.keys():
-            runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
-        step = ckpts[0]["step"]
-        runner.train(step=step)
-    else:
-        runner.train()
+    runner.train()
 
     if not cfg.disable_viewer:
         print("Viewer running... Ctrl+C to exit.")
@@ -1175,6 +1326,10 @@ if __name__ == "__main__":
             ),
         ),
     }
+    # Accept the requested dotted spelling as well as Tyro's standard flag names.
+    sys.argv[1:] = [arg.replace("--target_frame.json", "--target-frame", 1)
+                    if arg.split("=", 1)[0] == "--target_frame.json" else arg
+                    for arg in sys.argv[1:]]
     cfg = tyro.extras.overridable_config_cli(configs)
     cfg.adjust_steps(cfg.steps_scaler)
 

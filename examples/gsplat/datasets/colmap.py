@@ -317,7 +317,7 @@ class Parser:
 
 
 class Dataset:
-    """A simple dataset class."""
+    """Image or camera-only dataset; test_every=0 includes all frames in any split."""
 
     def __init__(
         self,
@@ -325,11 +325,15 @@ class Dataset:
         split: str = "train",
         patch_size: Optional[int] = None,
         load_depths: bool = False,
+        load_images: bool = True,
     ):
         self.parser = parser
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
+        self.load_images = load_images
+        if not load_images and (load_depths or patch_size is not None):
+            raise ValueError("Camera-only datasets do not support depth loading or image crops.")
         
         indices = np.arange(len(self.parser.image_names))
         if self.parser.test_every == 1:
@@ -352,12 +356,26 @@ class Dataset:
 
     def __getitem__(self, item: int) -> Dict[str, Any]:
         index = self.indices[item]
-        image = imageio.imread(self.parser.image_paths[index])[..., :3]
         camera_id = self.parser.camera_ids[index]
         K = self.parser.Ks_dict[camera_id].copy()  # undistorted K
         params = self.parser.params_dict[camera_id]
         camtoworlds = self.parser.camtoworlds[index]
         mask = self.parser.mask_dict[camera_id]
+
+        if not self.load_images:
+            width, height = self.parser.imsize_dict[camera_id]
+            return {
+                "K": torch.from_numpy(K).float(),
+                "camtoworld": torch.from_numpy(camtoworlds).float(),
+                "image_id": item,
+                "width": width,
+                "height": height,
+            }
+
+        image_path = self.parser.image_paths[index]
+        if image_path is None:
+            raise ValueError("This frame has no image; use load_images=False for camera-only data.")
+        image = imageio.imread(image_path)[..., :3]
 
         if len(params) > 0:
             # Images are distorted. Undistort them.

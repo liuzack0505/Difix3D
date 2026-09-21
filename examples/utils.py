@@ -42,7 +42,7 @@ class CameraPoseInterpolator:
         if np.dot(q1, q2) < 0:
             q2 = -q2
         
-        rotation_dist = np.arccos(2 * np.dot(q1, q2)**2 - 1)
+        rotation_dist = np.arccos(np.clip(2 * np.dot(q1, q2)**2 - 1, -1.0, 1.0))
         
         return (self.translation_weight * translation_dist + 
                 self.rotation_weight * rotation_dist)
