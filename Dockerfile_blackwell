@@ -1,0 +1,74 @@
+FROM nvidia/cuda:12.8.1-devel-ubuntu22.04
+
+ARG UID
+ARG GID
+
+ENV TORCH_CUDA_ARCH_LIST="12.0"
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    git \
+    python3 \
+    python3-dev \
+    python3-venv \
+    python3-pip \
+    python-is-python3 \
+    # prevent ImportError: libGL.so.1: cannot open shared object file: No such file or directory
+    libgl1 \
+    # prevent ImportError: libgthread-2.0.so.0: cannot open shared object file: No such file or directory
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# install pytorch 2.11 and xformers for CUDA 12.8
+# Warning: DON'T use pt 2.10 + cuda 12.8. It will cause the following error:
+# RuntimeError: CUDA error: CUBLAS_STATUS_NOT_INITIALIZED when calling `cublasLtMatmulAlgoGetHeuristic...
+RUN pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu128
+RUN pip3 install xformers==0.0.34 --index-url https://download.pytorch.org/whl/cu128 --no-deps
+
+# Install dependencies.
+WORKDIR /tmp
+COPY requirements.txt .
+RUN printf '%s\n' \
+        'torch==2.11.0' \
+        'torchvision==0.26.0' \
+        'torchaudio==2.11.0' \
+        > /tmp/constraints.txt && \
+    MAX_JOBS=4 pip install -r requirements.txt -c /tmp/constraints.txt && \
+    rm /tmp/requirements.txt /tmp/constraints.txt
+RUN MAX_JOBS=4 pip install --no-build-isolation git+https://github.com/nerfstudio-project/gsplat.git
+
+# Install flash-attn 2.8.2 to be compatible to the latest xformer and prevent following error:
+# ImportError: /usr/local/lib/python3.10/dist-packages/flash_attn_2_cuda.cpython-310-x86_64-linux-gnu.so: undefined symbol: _ZN3c104cuda9SetDeviceEa
+# RUN MAX_JOBS=4 pip install git+https://github.com/Dao-AILab/flash-attention.git@v2.8.2 --no-build-isolation
+
+
+# using pre-built wheel for CUDA 12.8 + torch 2.11.0
+RUN pip install https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.4/flash_attn-2.8.3+cu128torch2.11-cp310-cp310-linux_x86_64.whl
+
+# Install difix3d
+ENV HF_HOME=/opt/hf
+WORKDIR /opt
+RUN git clone https://github.com/nv-tlabs/Difix3D.git
+RUN pip install -r /opt/Difix3D/examples/gsplat/requirements.txt --no-build-isolation
+ENV PYTHONPATH="/opt/Difix3D:${PYTHONPATH}"
+
+# Create a group and user with the provided UID and GID.
+RUN if ! getent group ${GID} >/dev/null 2>&1; then \
+    groupadd -g ${GID} appgroup; \
+    fi && \
+    if ! getent passwd ${UID} >/dev/null 2>&1; then \
+    useradd -r -u ${UID} -m  -s /bin/bash -g appgroup appuser; \
+    fi
+
+# Switch to the non-root user and download the Difix model
+USER ${UID}:${GID}
+ENV HF_HOME=/tmp
+WORKDIR /opt/Difix3D
+RUN python3 -c "from src.pipeline_difix import DifixPipeline; DifixPipeline.from_pretrained('nvidia/difix', trust_remote_code=True)"
+RUN python3 -c "from src.pipeline_difix import DifixPipeline; DifixPipeline.from_pretrained('nvidia/difix_ref', trust_remote_code=True)"
+
+WORKDIR /app
+
+
+
