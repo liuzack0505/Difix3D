@@ -54,6 +54,8 @@ RUN pip install -r /opt/Difix3D/examples/gsplat/requirements.txt --no-build-isol
 ENV PYTHONPATH="/opt/Difix3D:${PYTHONPATH}"
 
 # Create a group and user with the provided UID and GID.
+ARG UID=1005
+ARG GID=1006
 RUN if ! getent group ${GID} >/dev/null 2>&1; then \
     groupadd -g ${GID} appgroup; \
     fi && \
@@ -70,5 +72,6 @@ RUN python3 -c "from src.pipeline_difix import DifixPipeline; DifixPipeline.from
 
 WORKDIR /app
 
+CMD [ "sleep", "infinity" ]
 
 
