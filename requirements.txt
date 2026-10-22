@@ -1,5 +1,5 @@
 plyfile
-pycolmap
+pycolmap>=3.12
 torchmetrics
 wandb
 imageio[ffmpeg]

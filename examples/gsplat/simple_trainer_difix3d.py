@@ -107,7 +107,7 @@ class Config:
     # Difix reference view: nearest training pose (raw or scale-normalized distance),
     # or training view sharing the most visible Gaussians
     ref_selection: Literal["pose", "normalized_pose", "overlap"] = "pose"
-    # After training, render the target views with the final model into renders/novel/<last step>/
+    # After training, render the target views with the final model into renders/novel/<max_steps>/
     render_novel_at_end: bool = False
 
     # Initialization strategy
@@ -996,7 +996,8 @@ class Runner:
 
         if cfg.render_novel_at_end:
             # Final model at the target views, stored beside the fix steps' renders for comparison.
-            self.render_traj(max_steps - 1, dataset=self.targetset)
+            # Fix steps run at step <= max_steps - 1, so max_steps never collides with their folders.
+            self.render_traj(max_steps, dataset=self.targetset)
 
     @torch.no_grad()
     def fix(self, step: int):

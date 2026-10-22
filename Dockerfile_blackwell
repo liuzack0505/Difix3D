@@ -1,7 +1,10 @@
 FROM nvidia/cuda:12.8.1-devel-ubuntu22.04
 
+# Required: docker build --build-arg UID=$(id -u) --build-arg GID=$(id -g) ...
 ARG UID
 ARG GID
+RUN test -n "${UID}" && test -n "${GID}" || \
+    (echo "Pass --build-arg UID=\$(id -u) --build-arg GID=\$(id -g)" >&2; exit 1)
 
 ENV TORCH_CUDA_ARCH_LIST="12.0"
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
@@ -50,12 +53,13 @@ RUN pip install https://github.com/mjun0812/flash-attention-prebuild-wheels/rele
 ENV HF_HOME=/opt/hf
 WORKDIR /opt
 RUN git clone https://github.com/nv-tlabs/Difix3D.git
-RUN pip install -r /opt/Difix3D/examples/gsplat/requirements.txt --no-build-isolation
+# Use this repo's gsplat requirements: upstream still pins the old rmbrualla/pycolmap fork,
+# which shadows official pycolmap and lacks the Reconstruction API used by datasets/colmap.py.
+COPY examples/gsplat/requirements.txt /tmp/gsplat_requirements.txt
+RUN pip install -r /tmp/gsplat_requirements.txt --no-build-isolation && rm /tmp/gsplat_requirements.txt
 ENV PYTHONPATH="/opt/Difix3D:${PYTHONPATH}"
 
 # Create a group and user with the provided UID and GID.
-ARG UID=1005
-ARG GID=1006
 RUN if ! getent group ${GID} >/dev/null 2>&1; then \
     groupadd -g ${GID} appgroup; \
     fi && \
