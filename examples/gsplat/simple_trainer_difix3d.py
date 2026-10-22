@@ -101,6 +101,10 @@ class Config:
     # Steps to fix the artifacts
     fix_steps: List[int] = field(default_factory=lambda: [3_000, 6_000, 8_000, 10_000, 12_000, 14_000, 16_000, 18_000, 20_000, 22_000, 24_000, 26_000, 28_000, 30_000, 32_000, 34_000, 36_000, 38_000, 40_000, 42_000, 44_000, 46_000, 48_000, 50_000, 52_000, 54_000, 56_000, 58_000, 60_000])
 
+    # Difix reference view: nearest training pose (raw or scale-normalized distance),
+    # or training view sharing the most visible Gaussians
+    ref_selection: Literal["pose", "normalized_pose", "overlap"] = "pose"
+
     # Initialization strategy
     init_type: str = "sfm"
     # Initial number of GSs. Ignored if using sfm
@@ -979,7 +983,7 @@ class Runner:
                 self.viewer.state.num_train_rays_per_sec = num_train_rays_per_sec
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
-    
+
     @torch.no_grad()
     def fix(self, step: int):
         print("Running fixer...")
@@ -998,17 +1002,42 @@ class Runner:
         self.render_traj(step, novel_poses, dataset=self.targetset)
         image_paths = [f"{self.render_dir}/novel/{step}/Pred/{i:04d}.png" for i in range(len(novel_poses))]
 
-        if len(self.novelloaders) == 0:
-            ref_image_indices = self.interpolator.find_nearest_assignments(self.parser.camtoworlds[self.trainset.indices], novel_poses)
-            ref_image_paths = [self.parser.image_paths[i] for i in np.array(self.trainset.indices)[ref_image_indices]]
+        if self.targetset is None:
+            source_id = self.parser.camera_ids[0]
+            Ks = [self.parser.Ks_dict[source_id]] * len(novel_poses)
+            sizes = [self.parser.imsize_dict[source_id]] * len(novel_poses)
         else:
-            ref_image_indices = self.interpolator.find_nearest_assignments(self.parser.camtoworlds[self.trainset.indices], novel_poses)
-            ref_image_paths = [self.parser.image_paths[i] for i in np.array(self.trainset.indices)[ref_image_indices]]
+            camera_ids = [self.target_parser.camera_ids[i] for i in self.targetset.indices]
+            Ks = [self.target_parser.Ks_dict[i] for i in camera_ids]
+            sizes = [self.target_parser.imsize_dict[i] for i in camera_ids]
+
+        train_indices = np.array(self.trainset.indices)
+        if self.cfg.ref_selection == "overlap":
+            def render_depth(camtoworld, K, width, height):
+                depths, alphas, _ = self.rasterize_splats(
+                    camtoworlds=camtoworld[None], Ks=K[None], width=width, height=height,
+                    near_plane=self.cfg.near_plane, far_plane=self.cfg.far_plane, render_mode="ED",
+                )
+                return torch.where(alphas[0, ..., 0] > 0.5, depths[0, ..., 0], torch.inf)
+
+            # Parser.imsize_dict holds the first image's size for every camera, so read each image's real size.
+            ref_image_indices = self.interpolator.find_most_overlay_gaussian_assignments(
+                self.parser.camtoworlds[train_indices], novel_poses, self.splats["means"], render_depth,
+                [self.parser.Ks_dict[self.parser.camera_ids[i]] for i in train_indices],
+                [Image.open(self.parser.image_paths[i]).size for i in train_indices],
+                Ks, sizes,
+            )
+        elif self.cfg.ref_selection == "normalized_pose":
+            ref_image_indices = self.interpolator.find_nearest_normalized_assignments(self.parser.camtoworlds[train_indices], novel_poses)
+        else:
+            ref_image_indices = self.interpolator.find_nearest_assignments(self.parser.camtoworlds[train_indices], novel_poses)
+        ref_image_paths = [self.parser.image_paths[i] for i in train_indices[ref_image_indices]]
         assert len(image_paths) == len(ref_image_paths) == len(novel_poses)
 
         for i in tqdm.trange(0, len(novel_poses), desc="Fixing artifacts..."):
             image = Image.open(image_paths[i]).convert("RGB")
             ref_image = Image.open(ref_image_paths[i]).convert("RGB")
+            ref_image = ref_image.resize(image.size, Image.LANCZOS)
             output_image = self.difix(prompt="remove degradation", image=image, ref_image=ref_image, num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]
             output_image = output_image.resize(image.size, Image.LANCZOS)
             os.makedirs(f"{self.render_dir}/novel/{step}/Fixed", exist_ok=True)
@@ -1024,14 +1053,6 @@ class Runner:
         parser.alpha_mask_paths = [f"{self.render_dir}/novel/{step}/Alpha/{i:04d}.png" for i in range(len(novel_poses))]
         parser.camtoworlds = novel_poses
         parser.camera_ids = list(range(len(novel_poses)))
-        if self.targetset is None:
-            source_id = self.parser.camera_ids[0]
-            Ks = [self.parser.Ks_dict[source_id]] * len(novel_poses)
-            sizes = [self.parser.imsize_dict[source_id]] * len(novel_poses)
-        else:
-            camera_ids = [self.target_parser.camera_ids[i] for i in self.targetset.indices]
-            Ks = [self.target_parser.Ks_dict[i] for i in camera_ids]
-            sizes = [self.target_parser.imsize_dict[i] for i in camera_ids]
         parser.Ks_dict = dict(enumerate(Ks))
         parser.imsize_dict = dict(enumerate(sizes))
         # Rendered images are already undistorted.
