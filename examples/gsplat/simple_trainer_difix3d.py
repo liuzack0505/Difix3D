@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import shutil
 import sys
 import time
 from dataclasses import dataclass, field
@@ -101,9 +102,13 @@ class Config:
     # Steps to fix the artifacts
     fix_steps: List[int] = field(default_factory=lambda: [3_000, 6_000, 8_000, 10_000, 12_000, 14_000, 16_000, 18_000, 20_000, 22_000, 24_000, 26_000, 28_000, 30_000, 32_000, 34_000, 36_000, 38_000, 40_000, 42_000, 44_000, 46_000, 48_000, 50_000, 52_000, 54_000, 56_000, 58_000, 60_000])
 
+    # Max distance novel poses move toward target poses at each fix step
+    novel_shift_distance: float = 0.1
     # Difix reference view: nearest training pose (raw or scale-normalized distance),
     # or training view sharing the most visible Gaussians
     ref_selection: Literal["pose", "normalized_pose", "overlap"] = "pose"
+    # After training, render the target views with the final model into renders/novel/<last step>/
+    render_novel_at_end: bool = False
 
     # Initialization strategy
     init_type: str = "sfm"
@@ -394,6 +399,9 @@ class Runner:
         self.device = f"cuda:{local_rank}"
 
         # Where to dump results.
+        if world_rank == 0:
+            if os.path.exists(cfg.result_dir):
+                shutil.rmtree(cfg.result_dir)
         os.makedirs(cfg.result_dir, exist_ok=True)
 
         # Setup output directories.
@@ -427,6 +435,8 @@ class Runner:
         # The targetset is different from valset. Targetset didn't have GT for evaluation. It is used for gradual target view optimization.
         self.target_parser = None
         self.targetset = None
+        if cfg.render_novel_at_end and cfg.target_frame_path is None:
+            raise ValueError("render_novel_at_end requires target_frame_path.")
         if cfg.target_frame_path is not None:
             if cfg.camera_model != "pinhole":
                 raise ValueError("JSON target cameras require camera_model=pinhole.")
@@ -984,6 +994,10 @@ class Runner:
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
 
+        if cfg.render_novel_at_end:
+            # Final model at the target views, stored beside the fix steps' renders for comparison.
+            self.render_traj(max_steps - 1, dataset=self.targetset)
+
     @torch.no_grad()
     def fix(self, step: int):
         print("Running fixer...")
@@ -996,7 +1010,7 @@ class Runner:
             novel_poses = target_poses
         else:
             novel_poses = self.interpolator.shift_poses(
-                self.current_novel_poses, target_poses
+                self.current_novel_poses, target_poses, distance=self.cfg.novel_shift_distance
             )
 
         self.render_traj(step, novel_poses, dataset=self.targetset)
