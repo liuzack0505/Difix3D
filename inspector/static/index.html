@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Difix3D Inspector</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <aside class="sidebar">
+    <header>
+      <h1>Difix3D Inspector</h1>
+      <p class="result-dir" id="result-dir"></p>
+    </header>
+
+    <label class="field">
+      <span>Fix step</span>
+      <select id="step-select"></select>
+    </label>
+
+    <fieldset class="field">
+      <legend>Show</legend>
+      <div id="type-toggles" class="toggles"></div>
+    </fieldset>
+
+    <div class="field views">
+      <div class="views-header">
+        <span>Views</span>
+        <span class="hint">↑ ↓ to browse</span>
+      </div>
+      <ol id="view-list" class="view-list"></ol>
+    </div>
+  </aside>
+
+  <main>
+    <div class="toolbar">
+      <h2 id="view-title">–</h2>
+      <span id="view-position" class="position"></span>
+      <div class="download-controls">
+        <button id="download" type="button" class="primary" disabled>Download</button>
+        <span id="download-hint" class="hint">Click images to select</span>
+      </div>
+      <div class="zoom-controls">
+        <span class="hint">Scroll to zoom · drag to pan · double-click to reset</span>
+        <span id="zoom-level" class="zoom-level">100%</span>
+        <button id="zoom-reset" type="button">Reset</button>
+      </div>
+    </div>
+    <div id="panels" class="panels"></div>
+    <p id="empty" class="empty" hidden></p>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

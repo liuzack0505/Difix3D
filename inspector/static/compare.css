@@ -1,0 +1,66 @@
+/* Reference-selection comparison page; builds on style.css tokens and components. */
+
+.run-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.run-list li { display: flex; flex-direction: column; gap: 1px; }
+.run-list .run-label { font-weight: 600; }
+.run-list .run-description { color: var(--muted); font-size: 12px; }
+
+.view-list li.group {
+  cursor: default;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  background: var(--bg);
+  position: sticky;
+  top: 0;
+}
+.view-list li.group:hover { background: var(--bg); }
+
+main { overflow-y: auto; }
+
+.download-controls button:not(.primary) {
+  font: inherit;
+  padding: 4px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+}
+.download-controls button:not(.primary):hover { border-color: var(--accent); color: var(--accent); }
+.download-controls button:disabled { opacity: 0.6; cursor: progress; }
+
+/* One row per strategy: a row header, then one panel per shown image type. */
+.compare-grid {
+  display: grid;
+  grid-template-columns: 150px repeat(var(--cols, 3), minmax(0, 1fr));
+  gap: 10px;
+  align-items: start;
+}
+.column-header { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+.row-header { align-self: center; display: flex; flex-direction: column; gap: 3px; }
+.row-header .run-label { font-weight: 700; font-size: 15px; }
+.row-header .run-description { color: var(--muted); font-size: 12px; }
+
+/* Panels keep the image's aspect, so zoomed crops map 1:1 to image regions (used by the slide export). */
+.compare-grid .panel-body { flex: none; aspect-ratio: var(--image-aspect, 2.187); }
+.compare-grid.pixelated img { image-rendering: pixelated; }
+
+.badge {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.badge.same { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+
+@media (max-width: 760px) {
+  .compare-grid { grid-template-columns: minmax(0, 1fr); }
+  .column-header { display: none; }
+  main { overflow: visible; }
+}

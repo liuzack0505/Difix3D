@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Reference Selection Compare</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="compare.css">
+</head>
+<body>
+  <aside class="sidebar">
+    <header>
+      <h1>Reference selection</h1>
+      <p class="result-dir">Difix reference views picked by each strategy</p>
+    </header>
+
+    <div class="field">
+      <span>Strategies</span>
+      <ol id="run-list" class="run-list"></ol>
+    </div>
+
+    <fieldset class="field">
+      <legend>Show</legend>
+      <div id="column-toggles" class="toggles"></div>
+    </fieldset>
+
+    <div class="field views">
+      <div class="views-header">
+        <span>Views</span>
+        <span class="hint">↑ ↓ to browse</span>
+      </div>
+      <ol id="view-list" class="view-list"></ol>
+    </div>
+  </aside>
+
+  <main>
+    <div class="toolbar">
+      <h2 id="view-title">–</h2>
+      <span id="view-position" class="position"></span>
+      <div class="download-controls">
+        <button id="download-all" type="button" class="primary">Download all images</button>
+        <button id="download-slide" type="button">Download slide image</button>
+      </div>
+      <div class="zoom-controls">
+        <span class="hint">Scroll to zoom · drag to pan · double-click to reset</span>
+        <span id="zoom-level" class="zoom-level">100%</span>
+        <button id="zoom-reset" type="button">Reset</button>
+      </div>
+    </div>
+    <div id="grid" class="compare-grid"></div>
+    <p id="status" class="empty" hidden></p>
+  </main>
+
+  <script src="compare.js"></script>
+</body>
+</html>
