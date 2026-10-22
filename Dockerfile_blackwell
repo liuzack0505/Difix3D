@@ -49,15 +49,10 @@ RUN MAX_JOBS=4 pip install --no-build-isolation git+https://github.com/nerfstudi
 # using pre-built wheel for CUDA 12.8 + torch 2.11.0
 RUN pip install https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.4/flash_attn-2.8.3+cu128torch2.11-cp310-cp310-linux_x86_64.whl
 
-# Install difix3d
-ENV HF_HOME=/opt/hf
-WORKDIR /opt
-RUN git clone https://github.com/nv-tlabs/Difix3D.git
-# Use this repo's gsplat requirements: upstream still pins the old rmbrualla/pycolmap fork,
-# which shadows official pycolmap and lacks the Reconstruction API used by datasets/colmap.py.
+# Install gsplat example dependencies. Only the requirements file is copied here so that
+# code changes do not invalidate the pip layers.
 COPY examples/gsplat/requirements.txt /tmp/gsplat_requirements.txt
 RUN pip install -r /tmp/gsplat_requirements.txt --no-build-isolation && rm /tmp/gsplat_requirements.txt
-ENV PYTHONPATH="/opt/Difix3D:${PYTHONPATH}"
 
 # Create a group and user with the provided UID and GID.
 RUN if ! getent group ${GID} >/dev/null 2>&1; then \
@@ -67,14 +62,16 @@ RUN if ! getent group ${GID} >/dev/null 2>&1; then \
     useradd -r -u ${UID} -m  -s /bin/bash -g appgroup appuser; \
     fi
 
+# Copy this Difix3D checkout (build context = repo root, see .dockerignore) into /workspace.
+COPY --chown=${UID}:${GID} . /workspace
+ENV PYTHONPATH=/workspace
+
 # Switch to the non-root user and download the Difix model
 USER ${UID}:${GID}
 ENV HF_HOME=/tmp
-WORKDIR /opt/Difix3D
+WORKDIR /workspace
 RUN python3 -c "from src.pipeline_difix import DifixPipeline; DifixPipeline.from_pretrained('nvidia/difix', trust_remote_code=True)"
 RUN python3 -c "from src.pipeline_difix import DifixPipeline; DifixPipeline.from_pretrained('nvidia/difix_ref', trust_remote_code=True)"
-
-WORKDIR /app
 
 CMD [ "sleep", "infinity" ]
 
